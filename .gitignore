@@ -1,0 +1,7 @@
+# Folders
+data/
+.vscode/
+
+# File extensions
+*.code-workspace
+*.ipynb_checkpoints
