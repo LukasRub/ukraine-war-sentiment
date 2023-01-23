@@ -29,7 +29,7 @@ class TqdmLoggingHandler(logging.StreamHandler):
 
     def emit(self, record):
         msg = self.format(record)
-        tqdm.tqdm.write(msg)
+        tqdm.write(msg)
 
 
 def timeit(f):
@@ -38,78 +38,94 @@ def timeit(f):
         t0 = time.time()
         result = f(*args, **kwargs)
         t1 = time.time()
-        print(("Function {f_name} args:[{args}, {kwargs}] took: {time:.2f} secs."
-                   .format(f_name=f.__name__, args=args, kwargs=kwargs, time=t1-t0)))
+        logging.info(("Function {f_name} args:[{args}, {kwargs}]"
+                      + " took: {time:.2f} secs.") \
+            .format(f_name=f.__name__, 
+                    args=args, 
+                    kwargs=kwargs, 
+                    time=t1-t0))
         return result
     return wrap
 
 
-def send_request(parameters, timeout=10, endpoint=API_ENDPOINT):
-    response = requests.get(endpoint, params=parameters)
-    
-    if response.status_code == 200:
-        response = response.json()
-        metadata = response["metadata"] if "metadata" in response.keys() else None
-        data = response["data"]
-        return (metadata, data)
-    
-    elif response.status_code == 429:
-        print(f"Rate limit reached, sleeping for {timeout} secs.")
-        time.sleep(timeout)
-        return send_request(parameters)
-    
-    elif response.status_code >= 500:
-        print(f"Server error (HTTP {response.status_code}), sleeping for {timeout} secs.")
-        time.sleep(timeout)
-        return send_request(parameters)
-    
-    else:
-        raise NotImplementedError("HTTP status code {}".format(response.status_code))
+def send_request(parameters, timeout, endpoint=API_ENDPOINT):
+    while True:
+        
+        response = requests.get(endpoint, params=parameters)
+        
+        if response.status_code == 200:
+            response = response.json()
+            metadata = response["metadata"] if "metadata" in response.keys() else None
+            data = response["data"]
+            return (metadata, data)
+        
+        elif response.status_code == 429:
+            logging.info(f"Rate limit reached sleeping for {timeout} secs.")
+            time.sleep(timeout)
+        
+        elif response.status_code >= 500:
+            logging.info(("Server error (HTTP {status_code}), "
+                        + "sleeping for {timeout} secs.") \
+                            .format(status_code=response.status_code,
+                                    timeout=timeout))
+            time.sleep(timeout)
+        
+        else:
+            raise NotImplementedError(f"HTTP status code {response.status_code}")
 
 
-def format_query_params(after, before=None, include_metadata=False,
-                        query_str=QUERY_STRING, subreddit=SUBREDDIT, size=300):
+def format_query_params(after, size, before=None, include_metadata=False,
+                        query_str=QUERY_STRING, subreddit=SUBREDDIT):
     params = {
         "q": query_str, 
         "subreddit": subreddit,
         "metadata": include_metadata, 
-        "size":size,
-        "after": after
+        "size": size,
+        "after": after,
+        "order": "asc"
     }
     if before is not None:
         params["before"] = before
     return params
 
 
-@timeit   
-def get_daily_comments(after_datetime, before_datetime):
+@timeit
+def get_daily_comments(after_datetime, before_datetime, batch_size, timeout):
     after_timestamp = int(after_datetime.timestamp())
     before_timestamp = int(before_datetime.timestamp())
     
-    get_next_query_params = partial(format_query_params, before=before_timestamp)
+    get_next_query_params = partial(format_query_params, before=before_timestamp, size=batch_size)
+    
     params = get_next_query_params(after=after_timestamp, include_metadata=True)
-    
-    
-    metadata, comments = send_request(params)
+    metadata, comments = send_request(params, timeout=timeout)
+
     iteration = 0
-    print(f"#{iteration+1}: {len(comments)} ({len(comments)}/{metadata['total_results']})")
+    logging.info("Batch {iter_}, {batch_size} ({downloaded}/{available})" \
+        .format(iter_=iteration,
+                batch_size=len(comments),
+                downloaded=len(comments),
+                available=metadata["es"]["hits"]["total"]["value"]))
 
     while True:
-        params = get_next_query_params(after=int(comments[-1]["created_utc"]))
-        _, data = send_request(params)
+        # `after` param relation changed from "gt" to "gte" hence + 1
+        params = get_next_query_params(after=int(comments[-1]["created_utc"]) + 1)
+        _, data = send_request(params, timeout=timeout)
         
         if bool(data):
             comments += list(data)
             iteration += 1
-            print(f"#{iteration+1}: {len(data)} ({len(comments)}/{metadata['total_results']})")
+            logging.info("Batch {iter_}, {batch_size} ({downloaded}/{available})" \
+                .format(iter_=iteration,
+                        batch_size=len(data),
+                        downloaded=len(comments),
+                        available=metadata["es"]["hits"]["total"]["value"]))
         else:
             break
     
     return metadata, comments
 
 
-def main(start_date, end_date=None, force_rewrite=False,
-         dest_folder=pathlib.Path("data/comments/raw")):
+def main(start_date, end_date, batch_size, timeout, dest_folder, force_rewrite):
 
     # Generating a list of days beween the start date and the end date
     if end_date is None:
@@ -118,14 +134,20 @@ def main(start_date, end_date=None, force_rewrite=False,
         date_range = pd.date_range(start_date, end_date)
 
 
-    for i, (after_datetime, before_datetime) in enumerate(pairwise(date_range)):
+    for i, (after_datetime, before_datetime) in enumerate(tqdm(pairwise(date_range))):
+        target_date_str = after_datetime.strftime("%Y-%m-%d")
 
-        # Skip if data for this date already exists and should not be overwritten
-        target_folder = dest_folder.joinpath(after_datetime.strftime("%Y-%m-%d"))
+        # Skip if data for this date already exists 
+        # and should not be overwritten
+        target_folder = dest_folder.joinpath(target_date_str)
         if target_folder.exists() and target_folder.is_dir() and not force_rewrite:
+            logging.info("Data for {date} already exist, skipping" \
+                .format(date=target_date_str))
             continue
 
-        metadata, comments = get_daily_comments(after_datetime, before_datetime)
+        logging.info("Getting data for {date}...".format(date=target_date_str))
+        metadata, comments = get_daily_comments(after_datetime, before_datetime,
+                                                batch_size, timeout)
 
         # Write data to disk
         target_folder.mkdir(parents=True, exist_ok=True)
@@ -139,10 +161,7 @@ def main(start_date, end_date=None, force_rewrite=False,
         metadata_file = target_folder.joinpath(METADATA_FILENAME)
         with open(metadata_file, "w", encoding="utf8") as fp:
             json.dump(metadata, fp, ensure_ascii=False, indent="\t")
-
-        if i > 1:
-            break
-
+        
 
 def date_str_to_ISO_8601(date_str):
     try:
@@ -165,6 +184,15 @@ if __name__ == "__main__":
         metavar="YYYY-MM-DD",  
         help="""End date (exclusive) before which comments should be requested. 
                 ISO 8601 format (YYYY-MM-DD). Default timezone UTC.""")
+    
+    parser.add_argument("--batch-size", type=int, nargs="?", const=500, 
+        default=500, 
+        help="""Batch size for a single request.""")
+
+    
+    parser.add_argument("--timeout", type=int, nargs="?", const=10, default=10, 
+        help="""Timeout (seconds) if a rate limit is reached.""")
+
 
     parser.add_argument("--dest_folder", required=False, type=pathlib.Path, 
         default=pathlib.Path("data/comments/raw"), 
@@ -172,9 +200,11 @@ if __name__ == "__main__":
                 Defaults to `data/comments/raw` inside project directory.""")
 
     parser.add_argument("--force-rewrite", action="store_true", dest="force_rewrite",
-        help="""Force rewrite data even if a version of it exists already.""")   
+        help="""Force rewrite data even if a version of it exists already.""")
+
     
     
+    # Optional TODOs:
     # TODO: add query string parameter
     # TODO: add size arg
     # TODO: add timeout arg
@@ -184,5 +214,6 @@ if __name__ == "__main__":
     logging.basicConfig(format="%(asctime)s : %(levelname)s : %(message)s", 
                         level=logging.INFO, handlers=[TqdmLoggingHandler()])
         
-    main(start_date=args.start, end_date=args.end, dest_folder=args.dest_folder,
+    main(start_date=args.start, end_date=args.end, batch_size=args.batch_size,
+         timeout=args.timeout, dest_folder=args.dest_folder, 
          force_rewrite=args.force_rewrite)
