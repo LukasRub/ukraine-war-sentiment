@@ -201,13 +201,9 @@ if __name__ == "__main__":
 
     parser.add_argument("--force-rewrite", action="store_true", dest="force_rewrite",
         help="""Force rewrite data even if a version of it exists already.""")
-
-    
     
     # Optional TODOs:
     # TODO: add query string parameter
-    # TODO: add size arg
-    # TODO: add timeout arg
 
     args = parser.parse_args()
 
