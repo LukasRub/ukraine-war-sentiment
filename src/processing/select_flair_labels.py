@@ -7,7 +7,6 @@ from pathlib import Path
 from collections import OrderedDict
 
 import inquirer
-import keyboard
 
 
 FLAIR_INPUT_PATH = "data/flairs/raw/flairs_aggregated.pkl"
